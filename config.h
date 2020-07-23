@@ -140,7 +140,7 @@
 
 /* Maximum offset for integer addition / subtraction stages: */
 
-#define ARITH_MAX           35
+#define ARITH_MAX           128
 
 /* Limits for the test case trimmer. The absolute minimum chunk size; and
    the starting and ending divisors for chopping up the input file: */
@@ -188,7 +188,7 @@
    expensive deterministic steps. The actual divisor is set to
    2^EFF_MAP_SCALE2 bytes: */
 
-#define EFF_MAP_SCALE2      3
+#define EFF_MAP_SCALE2      0
 
 /* Minimum input file length at which the effector logic kicks in: */
 
@@ -198,6 +198,9 @@
    unconditionally (%): */
 
 #define EFF_MAX_PERC        90
+
+/* Stupid scheduling meme. For havoc, only mutate the "top" N taints */
+#define EFF_SCHEDULE_MEME   8
 
 /* UI refresh frequency (Hz): */
 

@@ -382,6 +382,16 @@ static inline u32 UR(u32 limit) {
 
 }
 
+/* Generate random number that is "effective". */
+static inline u32 UR_eff(u32* eff_top, u32 eff_cnt, u32 limit) {
+  // balance between explore and exploit.
+  if (UR(2) == 1) return UR(limit);
+  if (eff_cnt > EFF_SCHEDULE_MEME) eff_cnt = EFF_SCHEDULE_MEME;
+  u32 i = UR(eff_cnt);
+  if (eff_top[i] >= limit) return limit - 1;
+  else return eff_top[i];
+}
+
 
 /* Shuffle an array of pointers. Might be slightly biased. */
 
@@ -5107,6 +5117,64 @@ static u8 fuzz_one(char** argv) {
 
   memcpy(out_buf, in_buf, len);
 
+  /* Effector map setup. These macros calculate:
+
+     EFF_APOS      - position of a particular file offset in the map.
+     EFF_ALEN      - length of a map with a particular number of bytes.
+     EFF_SPAN_ALEN - map span for a sequence of bytes.
+
+   */
+
+#define EFF_APOS(_p)          ((_p) >> EFF_MAP_SCALE2)
+#define EFF_REM(_x)           ((_x) & ((1 << EFF_MAP_SCALE2) - 1))
+#define EFF_ALEN(_l)          (EFF_APOS(_l) + !!EFF_REM(_l))
+#define EFF_SPAN_ALEN(_p, _l) (EFF_APOS((_p) + (_l) - 1) - EFF_APOS(_p) + 1)
+
+  /* Initialize effector map for the next step (see comments below). Always
+     flag first and last byte as doing something. */
+
+#define TL45_CMD "./tl45_trace %s %s 2>/dev/null"
+  char* tl45_bin = "./a.bin";
+  int tl45_cmdlen = strlen(TL45_CMD) + 1 + strlen(tl45_bin) + strlen(queue_cur->fname);
+  char* tl45_cmd = ck_alloc(tl45_cmdlen);
+  snprintf(tl45_cmd, tl45_cmdlen, TL45_CMD, tl45_bin, queue_cur->fname);
+  // SAYF("cmd: %s\n", tl45_cmd);
+  FILE* tl45_fp = popen(tl45_cmd, "r");
+  ck_free(tl45_cmd);
+  if (!tl45_fp) {
+    PFATAL("unable to run tl45_trace");
+  }
+
+  u32 eff_top[EFF_SCHEDULE_MEME];
+  memset(eff_top, 0, sizeof(eff_top));
+  int eff_size = EFF_ALEN(len);
+  eff_map    = ck_alloc(eff_size);
+  eff_map[0] = 1;
+  if (EFF_APOS(len - 1) != 0) {
+    eff_map[EFF_APOS(len - 1)] = 1;
+    eff_cnt++;
+  }
+
+  SAYF("\n");
+  char tl45_buf[8];
+  u8 priority = 255;
+  while (tl45_buf[0] = 0, fgets(tl45_buf, sizeof(tl45_buf), tl45_fp)) {
+    if (tl45_buf[0]) tl45_buf[strlen(tl45_buf) - 1] = 0; // chomp newline
+    if (!tl45_buf[0]) break;
+    int interest = atoi(tl45_buf);
+    if (interest >= eff_size) {
+      eff_size = interest+1;
+      eff_map = ck_realloc(eff_map, eff_size);
+    }
+    if (!eff_map[interest]) eff_cnt++;
+    if (255-priority < sizeof(eff_top)) eff_top[255-priority] = interest;
+    eff_map[interest] = priority;
+    SAYF("%d(%d) ", interest, priority);
+    if (priority > 1) priority--;
+  }
+  SAYF("\n");
+  pclose(tl45_fp);
+
   /*********************
    * PERFORMANCE SCORE *
    *********************/
@@ -5292,30 +5360,6 @@ static u8 fuzz_one(char** argv) {
   stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP4] += stage_max;
 
-  /* Effector map setup. These macros calculate:
-
-     EFF_APOS      - position of a particular file offset in the map.
-     EFF_ALEN      - length of a map with a particular number of bytes.
-     EFF_SPAN_ALEN - map span for a sequence of bytes.
-
-   */
-
-#define EFF_APOS(_p)          ((_p) >> EFF_MAP_SCALE2)
-#define EFF_REM(_x)           ((_x) & ((1 << EFF_MAP_SCALE2) - 1))
-#define EFF_ALEN(_l)          (EFF_APOS(_l) + !!EFF_REM(_l))
-#define EFF_SPAN_ALEN(_p, _l) (EFF_APOS((_p) + (_l) - 1) - EFF_APOS(_p) + 1)
-
-  /* Initialize effector map for the next step (see comments below). Always
-     flag first and last byte as doing something. */
-
-  eff_map    = ck_alloc(EFF_ALEN(len));
-  eff_map[0] = 1;
-
-  if (EFF_APOS(len - 1) != 0) {
-    eff_map[EFF_APOS(len - 1)] = 1;
-    eff_cnt++;
-  }
-
   /* Walking byte. */
 
   stage_name  = "bitflip 8/8";
@@ -5350,8 +5394,8 @@ static u8 fuzz_one(char** argv) {
         cksum = ~queue_cur->exec_cksum;
 
       if (cksum != queue_cur->exec_cksum) {
+        if (!eff_map[EFF_APOS(stage_cur)]) eff_cnt++;
         eff_map[EFF_APOS(stage_cur)] = 1;
-        eff_cnt++;
       }
 
     }
@@ -5364,12 +5408,12 @@ static u8 fuzz_one(char** argv) {
      whole thing as worth fuzzing, since we wouldn't be saving much time
      anyway. */
 
-  if (eff_cnt != EFF_ALEN(len) &&
-      eff_cnt * 100 / EFF_ALEN(len) > EFF_MAX_PERC) {
+  if (eff_cnt != eff_size &&
+      eff_cnt * 100 / eff_size > EFF_MAX_PERC) {
 
-    memset(eff_map, 1, EFF_ALEN(len));
+    memset(eff_map, 255, eff_size);
 
-    blocks_eff_select += EFF_ALEN(len);
+    blocks_eff_select += eff_size;
 
   } else {
 
@@ -5377,7 +5421,7 @@ static u8 fuzz_one(char** argv) {
 
   }
 
-  blocks_eff_total += EFF_ALEN(len);
+  blocks_eff_total += eff_size;
 
   new_hit_cnt = queued_paths + unique_crashes;
 
@@ -5399,7 +5443,7 @@ static u8 fuzz_one(char** argv) {
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)]) {
       stage_max--;
       continue;
     }
@@ -5435,8 +5479,8 @@ static u8 fuzz_one(char** argv) {
   for (i = 0; i < len - 3; i++) {
 
     /* Let's consult the effector map... */
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
-        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)] &&
+        255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 2)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 3)]) {
       stage_max--;
       continue;
     }
@@ -5482,7 +5526,7 @@ skip_bitflip:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)]) {
       stage_max -= 2 * ARITH_MAX;
       continue;
     }
@@ -5546,7 +5590,7 @@ skip_bitflip:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)]) {
       stage_max -= 4 * ARITH_MAX;
       continue;
     }
@@ -5640,8 +5684,8 @@ skip_bitflip:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
-        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)] &&
+        255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 2)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 3)]) {
       stage_max -= 4 * ARITH_MAX;
       continue;
     }
@@ -5738,7 +5782,7 @@ skip_arith:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)]) {
       stage_max -= sizeof(interesting_8);
       continue;
     }
@@ -5789,7 +5833,7 @@ skip_arith:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)]) {
       stage_max -= sizeof(interesting_16);
       continue;
     }
@@ -5857,8 +5901,8 @@ skip_arith:
 
     /* Let's consult the effector map... */
 
-    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
-        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+    if (255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 1)] &&
+        255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 2)] && 255-EFF_SCHEDULE_MEME > eff_map[EFF_APOS(i + 3)]) {
       stage_max -= sizeof(interesting_32) >> 1;
       continue;
     }
@@ -5949,7 +5993,7 @@ skip_interest:
       if ((extras_cnt > MAX_DET_EXTRAS && UR(extras_cnt) >= MAX_DET_EXTRAS) ||
           extras[j].len > len - i ||
           !memcmp(extras[j].data, out_buf + i, extras[j].len) ||
-          !memchr(eff_map + EFF_APOS(i), 1, EFF_SPAN_ALEN(i, extras[j].len))) {
+          memchr(eff_map + EFF_APOS(i), 0, EFF_SPAN_ALEN(i, extras[j].len))) {
 
         stage_max--;
         continue;
@@ -6049,7 +6093,7 @@ skip_user_extras:
 
       if (a_extras[j].len > len - i ||
           !memcmp(a_extras[j].data, out_buf + i, a_extras[j].len) ||
-          !memchr(eff_map + EFF_APOS(i), 1, EFF_SPAN_ALEN(i, a_extras[j].len))) {
+          memchr(eff_map + EFF_APOS(i), 0, EFF_SPAN_ALEN(i, a_extras[j].len))) {
 
         stage_max--;
         continue;
@@ -6139,14 +6183,14 @@ havoc_stage:
 
           /* Flip a single bit somewhere. Spooky! */
 
-          FLIP_BIT(out_buf, UR(temp_len << 3));
+          FLIP_BIT(out_buf, UR_eff(eff_top, eff_cnt, temp_len) << 3);
           break;
 
         case 1: 
 
           /* Set byte to interesting value. */
 
-          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
+          out_buf[UR_eff(eff_top, eff_cnt, temp_len)] = interesting_8[UR(sizeof(interesting_8))];
           break;
 
         case 2:
@@ -6157,12 +6201,12 @@ havoc_stage:
 
           if (UR(2)) {
 
-            *(u16*)(out_buf + UR(temp_len - 1)) =
+            *(u16*)(out_buf + UR_eff(eff_top, eff_cnt, temp_len - 1)) =
               interesting_16[UR(sizeof(interesting_16) >> 1)];
 
           } else {
 
-            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
+            *(u16*)(out_buf + UR_eff(eff_top, eff_cnt, temp_len - 1)) = SWAP16(
               interesting_16[UR(sizeof(interesting_16) >> 1)]);
 
           }
@@ -6177,12 +6221,12 @@ havoc_stage:
 
           if (UR(2)) {
   
-            *(u32*)(out_buf + UR(temp_len - 3)) =
+            *(u32*)(out_buf + UR_eff(eff_top, eff_cnt, temp_len - 3)) =
               interesting_32[UR(sizeof(interesting_32) >> 2)];
 
           } else {
 
-            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
+            *(u32*)(out_buf + UR_eff(eff_top, eff_cnt, temp_len - 3)) = SWAP32(
               interesting_32[UR(sizeof(interesting_32) >> 2)]);
 
           }
@@ -6193,14 +6237,14 @@ havoc_stage:
 
           /* Randomly subtract from byte. */
 
-          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
+          out_buf[UR_eff(eff_top, eff_cnt, temp_len)] -= 1 + UR(ARITH_MAX);
           break;
 
         case 5:
 
           /* Randomly add to byte. */
 
-          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
+          out_buf[UR_eff(eff_top, eff_cnt, temp_len)] += 1 + UR(ARITH_MAX);
           break;
 
         case 6:
@@ -6211,13 +6255,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 1);
 
             *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -6235,13 +6279,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 1);
 
             *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -6259,13 +6303,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 3);
 
             *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -6283,13 +6327,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 3);
 
             *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = UR_eff(eff_top, eff_cnt, temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -6305,7 +6349,7 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          out_buf[UR(temp_len)] ^= 1 + UR(255);
+          out_buf[UR_eff(eff_top, eff_cnt, temp_len)] ^= 1 + UR(255);
           break;
 
         case 11 ... 12: {
@@ -6322,7 +6366,7 @@ havoc_stage:
 
             del_len = choose_block_len(temp_len - 1);
 
-            del_from = UR(temp_len - del_len + 1);
+            del_from = UR_eff(eff_top, eff_cnt, temp_len - del_len + 1);
 
             memmove(out_buf + del_from, out_buf + del_from + del_len,
                     temp_len - del_from - del_len);
@@ -6346,7 +6390,7 @@ havoc_stage:
             if (actually_clone) {
 
               clone_len  = choose_block_len(temp_len);
-              clone_from = UR(temp_len - clone_len + 1);
+              clone_from = UR_eff(eff_top, eff_cnt, temp_len - clone_len + 1);
 
             } else {
 
@@ -6355,7 +6399,7 @@ havoc_stage:
 
             }
 
-            clone_to   = UR(temp_len);
+            clone_to   = UR_eff(eff_top, eff_cnt, temp_len);
 
             new_buf = ck_alloc_nozero(temp_len + clone_len);
 
@@ -6369,7 +6413,7 @@ havoc_stage:
               memcpy(new_buf + clone_to, out_buf + clone_from, clone_len);
             else
               memset(new_buf + clone_to,
-                     UR(2) ? UR(256) : out_buf[UR(temp_len)], clone_len);
+                     UR(2) ? UR(256) : out_buf[UR_eff(eff_top, eff_cnt, temp_len)], clone_len);
 
             /* Tail */
             memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
@@ -6394,8 +6438,8 @@ havoc_stage:
 
             copy_len  = choose_block_len(temp_len - 1);
 
-            copy_from = UR(temp_len - copy_len + 1);
-            copy_to   = UR(temp_len - copy_len + 1);
+            copy_from = UR_eff(eff_top, eff_cnt, temp_len - copy_len + 1);
+            copy_to   = UR_eff(eff_top, eff_cnt, temp_len - copy_len + 1);
 
             if (UR(4)) {
 
@@ -6403,7 +6447,7 @@ havoc_stage:
                 memmove(out_buf + copy_to, out_buf + copy_from, copy_len);
 
             } else memset(out_buf + copy_to,
-                          UR(2) ? UR(256) : out_buf[UR(temp_len)], copy_len);
+                          UR(2) ? UR(256) : out_buf[UR_eff(eff_top, eff_cnt, temp_len)], copy_len);
 
             break;
 
@@ -6427,7 +6471,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = UR(temp_len - extra_len + 1);
+              insert_at = UR_eff(eff_top, eff_cnt, temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
 
             } else {
@@ -6440,7 +6484,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = UR(temp_len - extra_len + 1);
+              insert_at = UR_eff(eff_top, eff_cnt, temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
 
             }
@@ -6451,7 +6495,7 @@ havoc_stage:
 
         case 16: {
 
-            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
+            u32 use_extra, extra_len, insert_at = UR_eff(eff_top, eff_cnt, temp_len + 1);
             u8* new_buf;
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
